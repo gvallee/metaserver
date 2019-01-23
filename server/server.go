@@ -8,6 +8,7 @@ package server
 import ("os"
 	"fmt"
 	"net/url"
+	"math/rand"
 	)
 
 import err "github.com/gvallee/syserror"
@@ -356,7 +357,6 @@ func (ns *Namespace) flush (basedir string) (err.SysError) {
 
 	// Figure out the file specific to the namespace
 	path := basedir + "/" + ns.name
-	fmt.Println ("Path: ", path)
 
 	var myerr error
 
@@ -453,7 +453,9 @@ func (ns *Namespace) flush (basedir string) (err.SysError) {
 func (aGoFS *MyGoFS) FlushMetadataToDisk (ns *Namespace) (err.SysError) {
 	basedir := aGoFS.LocalMetadataServer.basedir
 
-	return ns.flush(basedir)
+	go ns.flush(basedir) // flush can be expensive so we execute it asychronisely
+
+	return err.NoErr
 }
 
 /**
