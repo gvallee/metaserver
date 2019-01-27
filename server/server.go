@@ -1,17 +1,19 @@
 /*
- * Copyright(c)         Geoffroy Vallee
- *                      All rights reserved
+ * Copyright(c)         2019    Geoffroy Vallee
+ *                              All rights reserved
  */
 
 package server
 
 import ("os"
 	"fmt"
-	"net/url"
+	"net"
 	"math/rand"
+	"strings"
 	)
 
 import err "github.com/gvallee/syserror"
+import comm "github.com/gvallee/fscomm"
 
 /**
  * Structure representing the data server for a given namespace.
@@ -20,10 +22,13 @@ import err "github.com/gvallee/syserror"
  * namespace
  */
 type Dataserver struct {
-	surl            *url.URL // URL of the server, also used to connect to the server
+	surl            string // URL of the server, also used to connect to the server
 	block_size      uint64 // block size specific to the server
-	curBlock	uint64 // current block used for write operations
-	curOffset	uint64 // current block offset used for write operations
+	curWriteBlock   uint64 // current block used for write operations
+	curWriteOffset uint64 // current block offset used for write operations
+	curReadBlock    uint64 // current block used for read operations
+	curReadOffset   uint64 // current block offset used for read operations
+	conn            net.Conn // Connection to reach the server
 }
 
 /**
@@ -33,6 +38,8 @@ type DataInfo struct {
 	start           uint64 // Absolute start offset
 	end             uint64 // Absolute end offset
 	server          *Dataserver // Where the data is stored
+	blockid         uint64
+	blockoffset     uint64
 }
 
 /**
@@ -67,6 +74,7 @@ type Namespace struct {
 	lastReadDataserver	*Dataserver // Pointer to the server where the last read operation was performed (used to continue read operations in sub-sequent operations)
 	lastReadBlockid		uint64 // Block id used for the last read operation
 	readOffset		uint64 // Block offset used for the last read operation
+	globalOffset            uint64 // Global read offset, i.e., based on the overall data, not a specific block. Used for sequential reads over data spaning multiple servers.
 }
 
 /**
@@ -74,6 +82,7 @@ type Namespace struct {
  */
 type MyGoFS struct {
 	namespaces		map[string]*Namespace // List of existing namespaces in the current FS; used to lookup a namespace
+	listNamespaces		[]*Namespace // Overall list of namespaces so we can iterate over them
 
 	LocalMetadataServer     *Server // Pointer to the meta-data server's structure.
 }
@@ -83,22 +92,21 @@ type MyGoFS struct {
  * or testing with virtual data servers.
  * @param[in]	namespace	Namespace's name for which the server needs to be added
  * @param[in]	ds		Pointer to the sttructure representing the server to be added
- * @param[in]	uri		URL of the server to be added
+ * @param[in]	url		URL of the server to be added
+ * @param[in]	blocksize	Dataserver's block size
  * @return	System error handle
  */
-func (aFS *MyGoFS) AddDataserver (namespace string, ds *Dataserver, uri string) (err.SysError) {
-	if (aFS == nil) {
-		return err.ErrFatal
-	}
+func (aFS *MyGoFS) AddDataserver (namespace string, ds *Dataserver, url string, blocksize uint64) (err.SysError) {
+	if (aFS == nil) { return err.ErrFatal }
 
 	ns, nserr := aFS.LookupNamespace (namespace)
-	if (nserr != err.NoErr) {
-		return err.NoErr
-	}
+	if (nserr != err.NoErr) { return err.NoErr }
 
-	ns.dataservers[uri] = ds
+	ns.dataservers[url] = ds
 	ns.listDataservers = append (ns.listDataservers, ds)
 	ns.nds++
+	ds.block_size = blocksize
+	fmt.Println ("New dataserver registered with block size of", blocksize)
 
 	return err.NoErr
 }
@@ -107,10 +115,9 @@ func (aFS *MyGoFS) AddDataserver (namespace string, ds *Dataserver, uri string) 
  * Return the URL for a specific data server
  * @return Pointer to a URL structure and system error handle
  */
-func (ds *Dataserver) GetURI () (*url.URL, err.SysError) {
-	if (ds == nil) {
-		return nil, err.ErrFatal
-	}
+func (ds *Dataserver) GetURL () (string, err.SysError) {
+	if (ds == nil) { return "", err.ErrFatal }
+
 	return ds.surl, err.NoErr
 }
 
@@ -127,22 +134,32 @@ func (ds *Dataserver) GetFreeBlock (ns *Namespace) (uint64, err.SysError) {
 		return uint64(0), err.ErrFatal
 	}
 
-	lastEntry := len(ns.datainfo)
-	if (lastEntry == 0) {
+	if (len (ns.datainfo) == 0) {
 		// No data at all yet, we can use the first block
 		return 0, err.NoErr
 	}
 
-	fmt.Println ("Looking up for a free block - currrent block: ", ns.datainfo[lastEntry - 1].server.curBlock, ", current offset:", ns.datainfo[lastEntry - 1].server.curOffset, ", block size: ", ns.datainfo[lastEntry - 1].server.block_size)
-	if (ns.datainfo[lastEntry - 1].server.curOffset < ns.datainfo[lastEntry - 1].server.block_size) {
-		// We still have space in the last block we used
-		fmt.Println ("We still have space in block ", ns.datainfo[lastEntry - 1].server.curBlock)
-		return ns.datainfo[lastEntry - 1].server.curBlock, err.NoErr
+	// We need to find the last block writen to that server for the current namespace
+	var targetDS *Dataserver = nil
+	for i := len (ns.datainfo) - 1; i >= 0; i-- {
+		if (ns.datainfo[i].server == ds) {
+			// We found it!
+			targetDS = ns.datainfo[i].server
+		}
 	}
 
-	// We need to use a brand new block
-	fmt.Println ("Moving to next block")
-	return ns.datainfo[lastEntry - 1].server.curBlock + 1, err.NoErr
+	if (targetDS != nil) {
+		if (targetDS.curWriteOffset < targetDS.block_size) {
+			// We still have space in the last block we used
+			return targetDS.curWriteBlock, err.NoErr
+		}
+
+		// We need to use a brand new block
+		return targetDS.curWriteBlock + 1, err.NoErr
+	} else {
+		// That server is not used yet so we start at the first block
+		return 0, err.NoErr
+	}
 }
 
 /**
@@ -152,9 +169,17 @@ func (ds *Dataserver) GetFreeBlock (ns *Namespace) (uint64, err.SysError) {
  * @param[in]	url	Data server's URL
  * @return	System error handle
  */
-func (ds *Dataserver) Init (url *url.URL) (err.SysError) {
+func (ds *Dataserver) Init (url string) (err.SysError) {
+	if (ds == nil) { return err.ErrNotAvailable }
+
 	ds.surl = url
 	ds.block_size = 0
+	ds.curWriteBlock = 0
+	ds.curWriteOffset = 0
+	ds.curReadBlock = 0
+	ds.curReadOffset = 0
+	ds.conn = nil
+
 	return err.NoErr
 }
 
@@ -249,12 +274,45 @@ func (aGoFS *MyGoFS) LookupLastWriteBlockUsed (namespace string) (*Dataserver, u
 			return nil, 0, 0, 0, err.ErrFatal
 		}
 
-		fmt.Println ("Last write info found")
 		return ns.lastWriteDataserver, ns.lastWriteBlockid, blocksize, ns.writeOffset, err.NoErr
 	} else {
 		// We could find a last write yet
-		fmt.Println ("No last write info available")
 		return nil, 0, 0, 0, err.NoErr
+	}
+}
+
+/**
+ * Lookup where the last read operation stopped, i.e., which block on which server. Used to continue read operations.
+ * @input[in]   namespace       Namespace's name used for the read operation
+ * @dataserver   Pointer to the structure representing the data server where the last read operation ended
+ * @return blockid      Last block id used by the last read operation
+ * @return blocksize    Last block size used by the last read operation
+ * @return blockoffset  Last block offset used by the last read operation
+ * @return globalOffset Global offset where the last read stopped
+ * @return System error handle
+ */
+func (aGoFS *MyGoFS) LookupLastReadBlockUsed (namespace string) (*Dataserver, uint64, uint64, uint64, uint64, err.SysError) {
+	if (aGoFS == nil) { return nil, 0, 0, 0, 0, err.ErrFatal }
+
+	ns, myerr := aGoFS.LookupNamespace (namespace)
+	if (myerr != err.NoErr || ns == nil) { return nil, 0, 0, 0, 0, err.ErrNotAvailable }
+
+	if (ns.lastReadDataserver != nil) {
+		blocksize, myerr := ns.lastReadDataserver.GetBlocksize()
+		if (myerr != err.NoErr || blocksize == 0) { return nil, 0, 0, 0, 0, err.ErrFatal }
+
+		return ns.lastReadDataserver, ns.lastReadBlockid, blocksize, ns.readOffset, ns.globalOffset, err.NoErr
+	} else {
+		// No read operation yet, we look from the data map where is the begining of the data in the namespace
+		if (ns.datainfo == nil || ns.datainfo[0].server == nil) {
+			// We try to do a read but we have no data
+			return nil, 0, 0, 0, 0, err.ErrNotAvailable
+		}
+		firstserver := ns.datainfo[0].server
+		blocksize, myerr := firstserver.GetBlocksize()
+		if (myerr != err.NoErr || blocksize == 0) { return nil, 0, 0, 0, 0, err.ErrFatal }
+
+		return firstserver, 0, blocksize, 0, 0, err.NoErr
 	}
 }
 
@@ -272,6 +330,7 @@ func (aGoFS *MyGoFS) UpdateLastWriteInfo (ds *Dataserver, namespace string, bloc
 		return err.ErrFatal
 	}
 
+	fmt.Println ("Update last write info with block", blockid)
 	ns, myerr := aGoFS.LookupNamespace (namespace)
 	if (myerr != err.NoErr) {
 		return err.ErrFatal
@@ -281,14 +340,14 @@ func (aGoFS *MyGoFS) UpdateLastWriteInfo (ds *Dataserver, namespace string, bloc
 	ns.lastWriteBlockid = blockid
 	ns.writeOffset = writeSize
 
-	if (blockid == ds.curBlock && ds.curOffset < ds.block_size) {
+	if (blockid == ds.curWriteBlock && ds.curWriteOffset < ds.block_size) {
 		// The data was added to a block already inuse
-		ds.curOffset += writeSize
-		if (ds.curOffset > ds.block_size) { return err.ErrDataOverflow }
+		ds.curWriteOffset += writeSize
+		if (ds.curWriteOffset > ds.block_size) { return err.ErrDataOverflow }
 	} else {
 		// We use a new block
-		ds.curOffset = writeSize
-		ds.curBlock = blockid
+		ds.curWriteOffset = writeSize
+		ds.curWriteBlock = blockid
 	}
 
 	// Update the block map if necessary
@@ -296,7 +355,19 @@ func (aGoFS *MyGoFS) UpdateLastWriteInfo (ds *Dataserver, namespace string, bloc
 	start := blockid * ds.block_size + startOffset
 	for i := 0; i < len (ns.datainfo); i++ {
 		if (ns.datainfo[i].start <= start && (ns.datainfo[i].start + ns.datainfo[i].server.block_size) > start) {
+			fmt.Println ("Consecutive write detected to server", ds.surl, " with blocks ", ns.datainfo[i].blockid, "and", blockid)
+			if (ns.datainfo[i].blockid != blockid) {
+				// We are now using a new block
+				break
+			}
+
+			if (ns.datainfo[i].end != startOffset) {
+				// This is not a consecutive write, meaning since last write on this server, data was saved on another server so we need to precisely separate what is already there and the new data
+				break
+			}
 			entry_found = 1
+			// We added data to the block that we already used
+			ns.datainfo[i].end += writeSize
 		}
 		if (ns.datainfo[i].end > start) {
 			break
@@ -305,14 +376,17 @@ func (aGoFS *MyGoFS) UpdateLastWriteInfo (ds *Dataserver, namespace string, bloc
 
 	// We do not have a structure to track data yet so we need to add a new one (the goal being to known exactly where all the data is)
 	if (entry_found == 0) {
+		fmt.Println ("Using a new block for", start, "to", start + writeSize, "on", ds.surl)
 		di := new (DataInfo)
 		di.start = start
-		di.end = start + writeSize
+		di.end = start + writeSize - 1
 		di.server = ds
+		di.blockid = blockid
+		di.blockoffset = startOffset
 		ns.datainfo = append (ns.datainfo, di)
 	}
 
-	fmt.Println ("Recording write for namespace", namespace, "on block", blockid, "starting at", startOffset, "with", writeSize, "bytes")
+	fmt.Println ("Recording write for namespace", namespace, "on block", blockid, "starting at", startOffset, "with", writeSize, "bytes on", ds.surl)
 
 	// Flush the metadata to make sure it is saved on dick
 	aGoFS.FlushMetadataToDisk (ns)
@@ -341,6 +415,7 @@ func (aGoFS *MyGoFS) UpdateLastReadInfo (ds *Dataserver, namespace string, block
 	ns.lastReadDataserver = ds
 	ns.lastReadBlockid = blockid
 	ns.readOffset = readSize
+	ns.globalOffset = ns.globalOffset + readSize
 
 	return err.NoErr
 }
@@ -380,7 +455,7 @@ func (ns *Namespace) flush (basedir string) (err.SysError) {
 	_, write_err = ns.file.WriteString (fmt.Sprintf ("%d\n", len (ns.datainfo)))
 	if (write_err != nil) { return err.ErrFatal }
 	for i := 0; i < len (ns.datainfo); i++ {
-		_, write_err = ns.file.WriteString (ns.datainfo[i].server.surl.String() + " ")
+		_, write_err = ns.file.WriteString (ns.datainfo[i].server.surl + " ")
 		if (write_err != nil) { return err.ErrFatal }
 		_, write_err = ns.file.WriteString (fmt.Sprintf ("%d ", ns.datainfo[i].start))
 		if (write_err != nil) { return err.ErrFatal }
@@ -395,13 +470,13 @@ func (ns *Namespace) flush (basedir string) (err.SysError) {
 	if (write_err != nil) { return err.ErrFatal }
 
 	for i := 0; i < ns.nds; i++ {
-		_, write_err = ns.file.WriteString (ns.listDataservers[i].surl.String() + " ")
+		_, write_err = ns.file.WriteString (ns.listDataservers[i].surl + " ")
 		if (write_err != nil) { return err.ErrFatal }
 		_, write_err = ns.file.WriteString (fmt.Sprintf ("%d ", ns.listDataservers[i].block_size))
 		if (write_err != nil) { return err.ErrFatal }
-		_, write_err = ns.file.WriteString (fmt.Sprintf ("%d ", ns.listDataservers[i].curBlock))
+		_, write_err = ns.file.WriteString (fmt.Sprintf ("%d ", ns.listDataservers[i].curWriteBlock))
 		if (write_err != nil) { return err.ErrFatal }
-		_, write_err = ns.file.WriteString (fmt.Sprintf ("%d\n", ns.listDataservers[i].curOffset))
+		_, write_err = ns.file.WriteString (fmt.Sprintf ("%d\n", ns.listDataservers[i].curWriteOffset))
 		if (write_err != nil) { return err.ErrFatal }
 	}
 
@@ -409,7 +484,7 @@ func (ns *Namespace) flush (basedir string) (err.SysError) {
 	_, write_err = ns.file.WriteString (fmt.Sprintf ("# last write info\n"))
 	if (write_err != nil) { return err.ErrFatal }
 	if (ns.lastWriteDataserver != nil) {
-		_, write_err = ns.file.WriteString (ns.lastWriteDataserver.surl.String() + "\n")
+		_, write_err = ns.file.WriteString (ns.lastWriteDataserver.surl + "\n")
 		if (write_err != nil) { return err.ErrFatal }
 	} else {
 		_, write_err = ns.file.WriteString ("None\n")
@@ -424,7 +499,7 @@ func (ns *Namespace) flush (basedir string) (err.SysError) {
 	_, write_err = ns.file.WriteString (fmt.Sprintf ("# last read info\n"))
 	if (write_err != nil) { return err.ErrFatal }
 	if (ns.lastReadDataserver != nil) {
-		_, write_err = ns.file.WriteString (ns.lastReadDataserver.surl.String() + "\n")
+		_, write_err = ns.file.WriteString (ns.lastReadDataserver.surl + "\n")
 		if (write_err != nil) { return err.ErrFatal }
 	} else {
 		_, write_err = ns.file.WriteString ("None\n")
@@ -469,6 +544,7 @@ func (aGoFS *MyGoFS) AddNamespace (ns *Namespace) (err.SysError) {
 	}
 
 	aGoFS.namespaces[ns.name] = ns
+	aGoFS.listNamespaces = append (aGoFS.listNamespaces, ns)
 	return err.NoErr
 }
 
@@ -518,14 +594,22 @@ func (aGoFS *MyGoFS) Init (basedir string) (err.SysError) {
  * @param[in]	metadata_basedir	Basedir that the metadata server will use (the metadata server is instantiated in the client)
  * @return	Pointer to the structure representing the new file system associated to the client
  */
-func ClientInit (metadata_basedir string) *MyGoFS {
+func ClientInit (metadata_basedir string, servers string) *MyGoFS {
+
 	newGoFS := new (MyGoFS)
-	if (newGoFS == nil) {
-		return nil
-	}
+	if (newGoFS == nil) { return nil }
+
 	mysyserr := newGoFS.Init (metadata_basedir)
-	if (mysyserr != err.NoErr) {
-		return nil
+	if (mysyserr != err.NoErr) { return nil }
+
+	/* Connecting to data servers */
+	list_servers := strings.Split (servers, " ")
+	fmt.Println ("Connecting to", len (list_servers), "servers: ", servers)
+
+	for i := 0; i < len (list_servers); i++ {
+		fmt.Println ("\t-> Connecting to", list_servers[i])
+		connerr := newGoFS.ConnectToDataserver (list_servers[i])
+		if (connerr != err.NoErr) { return nil }
 	}
 
 	return newGoFS
@@ -534,8 +618,23 @@ func ClientInit (metadata_basedir string) *MyGoFS {
 /**
  * Finalize a client.
  */
-func ClientFini () {
-	// TODO
+func (myfs *MyGoFS) ClientFini () err.SysError {
+	if (myfs == nil) { return err.NoErr } // FS is already finalized
+
+	// We go through all the namespaces and disconnect from the data servers
+	for i := 0; i < len (myfs.listNamespaces); i++ {
+		for j := 0; j < len (myfs.listNamespaces[i].listDataservers); j++ {
+			if (myfs.listNamespaces[i].listDataservers[j] != nil && myfs.listNamespaces[i].listDataservers[j].conn != nil) {
+				// We assume that by the time we are done, we always disconnect from the data servers, sending them a termination message
+				comm.SendMsg (myfs.listNamespaces[i].listDataservers[j].conn, comm.TERMMSG, nil)
+				myfs.listNamespaces[i].listDataservers[j].conn.Close ()
+				myfs.listNamespaces[i].listDataservers[j].conn = nil
+			}
+		}
+	}
+
+	myfs = nil
+	return err.NoErr
 }
 
 /**
@@ -543,26 +642,69 @@ func ClientFini () {
  * @param[in]	server_url	URL of the server to conenct to
  * @return	System error handle
  */
-func ConnectToDataserver (server_url string) (err.SysError) {
-	servurl, myerr := url.Parse (server_url)
-	if (myerr != nil) {
-		return err.ErrFatal
-	}
+func (myfs *MyGoFS) ConnectToDataserver (server_url string) (err.SysError) {
+	if (myfs == nil) { return err.ErrNotAvailable }
 
+	fmt.Println ("Connecting to dataserver", server_url)
 	newDataServer := new (Dataserver)
-	newDataServer.Init (servurl)
+	newDataServer.Init (server_url)
+
+	conn, bs, connerr := comm.Connect2Server (server_url)
+	newDataServer.conn = conn
+	if (connerr != err.NoErr) { return err.ErrFatal }
+
+	// We always assume that the default namespace is ready to go, it is our reference namespace. So we add the dataserver to the default namespace
+	syserr := myfs.AddDataserver ("default", newDataServer, server_url, bs)
+	if (syserr != err.NoErr) { return err.ErrNotAvailable }
+
 	return err.NoErr
 }
 
 /**
- * We assume the call does not block and is fault tolerant
+ * Send a write request to a data server, so that the data will be stored in a block.
+ * Everything is ready so that the server can save the data directly upon reception.
+ * We assume the call does not block and is fault tolerant.
+ * @parma[in]	dataserver	Target data server
+ * @param[in]	namespace	Target namespace
+ * @param[in]	blockid		Target block id on the data server
+ * @param[in]	block_offset	Target block offset on the data server
+ * @param[in]	buff		Data to write into the target block on the data server
+ * @param[in]	buff_size	Size of the data in the buffer to save in the target block
+ * @param[in]	buff_offset	Offset in the buffer to save in the target block
+ * @return	System error handle
  */
 func (myFS *MyGoFS) SendWriteReq (dataserver *Dataserver, namespace string, blockid uint64, block_offset uint64, buff []byte, buff_size uint64, buff_offset uint64) (err.SysError) {
-	// Prepare the req
+	// Get the connection for the server
+	conn := dataserver.conn
+	if (conn == nil) { return err.ErrNotAvailable }
 
-	// Post the req
+	// We make sure to restrict the range on the data so we send just enough data for that
+	// specific block.
+	// Fortunately, Go slices are very helpful with notations such as buff[start:end]
+	senderr := comm.SendData (conn, namespace, blockid, block_offset, buff[buff_offset:buff_offset + buff_size])
+	if (senderr != err.NoErr) { return senderr }
 
-	// Update the server's last write info
+	return err.NoErr
+}
+
+/**
+ * Send a read request to a data server. The operation is blocking.
+ * We assume the call does not block and is fault tolerant.
+ * @parma[in]   dataserver      Target data server
+ * @param[in]   namespace       Target namespace
+ * @param[in]   blockid         Target block id on the data server
+ * @param[in]   block_offset    Target block offset on the data server
+ * @param[in]	size		Size of the data to read
+ * @return      System error handle
+ */
+func  (myFS *MyGoFS) SendReadReq (dataserver *Dataserver, namespace string, blockid uint64, offset uint64, size uint64) (err.SysError) {
+	// Get the connection for the server
+	conn := dataserver.conn
+	if (conn == nil) { return err.ErrNotAvailable }
+
+	senderr := comm.SendReadReq (conn, namespace, blockid, offset, size)
+	if (senderr != err.NoErr) { return senderr }
+
 	return err.NoErr
 }
 
@@ -593,35 +735,32 @@ func (myFS *MyGoFS) GetNextDataserver (ns *Namespace) (*Dataserver, err.SysError
 func (myFS *MyGoFS) Write (namespace string, buff []byte) (uint64, err.SysError) {
 	// First we look up the namespace
 	ns, mynserr := myFS.LookupNamespace (namespace)
-	if (mynserr != err.NoErr) {
-		return 0, err.ErrFatal
-	}
+	if (mynserr != err.NoErr) { return 0, err.ErrFatal }
 
 	// Lookup where we wrote data (server + blockid)
 	dataserver, blockid, blocksize, offset, mylookuperr := myFS.LookupLastWriteBlockUsed (namespace)
-	if (mylookuperr != err.NoErr) {
-		return 0, mylookuperr
-	}
+	if (mylookuperr != err.NoErr) { return 0, mylookuperr }
 
 	// A few variables that we will need, i.e., global info about the operation
 	var writeSize uint64
 	var totalSize uint64 = uint64 (len (buff))
 	var curSize uint64 = 0
+	fmt.Println (totalSize, "bytes to write...")
 
 	// Fill up the last block we used and split the rest of the data to different blocks on different dataserver
-	if (dataserver != nil && dataserver.curOffset < dataserver.block_size) {
-		serverURI, mySrvLookupErr := dataserver.GetURI()
-		if (mySrvLookupErr != err.NoErr) {
-			return 0, err.ErrFatal
-		}
+	if (dataserver != nil && dataserver.curWriteOffset < dataserver.block_size) {
+		serverURL, mySrvLookupErr := dataserver.GetURL ()
+		if (mySrvLookupErr != err.NoErr) { return 0, err.ErrFatal }
+
 		spaceLeft := blocksize - offset
+		fmt.Println ("Space left:", spaceLeft)
 		if (totalSize > spaceLeft) {
 			writeSize = spaceLeft
 		} else {
 			writeSize = totalSize
 		}
 
-		fmt.Printf ("Writing %d/%d to block %d on server %s\n", writeSize, len (buff), blockid, serverURI.String())
+		fmt.Printf ("Writing %d/%d to block %d on server %s\n", writeSize, len (buff), blockid, serverURL)
 		sendWriteReqErr := myFS.SendWriteReq (dataserver, namespace, blockid, offset, buff, writeSize, curSize)
 		if (sendWriteReqErr != err.NoErr) {
 			return 0, err.ErrFatal
@@ -629,34 +768,27 @@ func (myFS *MyGoFS) Write (namespace string, buff []byte) (uint64, err.SysError)
 		curSize += writeSize
 
 		// Update the block map & last block used info
-		fmt.Println ("Writing ", writeSize)
-		update_err := myFS.UpdateLastWriteInfo (dataserver, namespace, blockid, dataserver.curOffset, writeSize)
-		if (update_err != err.NoErr) {
-			return 0, update_err
-		}
+		update_err := myFS.UpdateLastWriteInfo (dataserver, namespace, blockid, dataserver.curWriteOffset, writeSize)
+		if (update_err != err.NoErr) { return 0, update_err }
+
+		fmt.Println ("Wrote", curSize, "bytes so far")
+
+		fmt.Println ("****************")
 	}
 
 	// Get the next server where to write data
 	for (totalSize > curSize) {
 		nextDataserver, myQueryErr := myFS.GetNextDataserver (ns)
-		if (myQueryErr != err.NoErr) {
-			return 0, err.ErrNotAvailable
-		}
+		if (myQueryErr != err.NoErr) { return 0, err.ErrNotAvailable }
 
 		blocksize, myQueryErr = nextDataserver.GetBlocksize()
-		if (myQueryErr != err.NoErr) {
-			return 0, err.ErrFatal
-		}
+		if (myQueryErr != err.NoErr) { return 0, err.ErrFatal }
 
-		serverURI, mySrvLookupErr := nextDataserver.GetURI()
-		if (mySrvLookupErr != err.NoErr) {
-			return 0, err.ErrFatal
-		}
+		serverURI, mySrvLookupErr := nextDataserver.GetURL ()
+		if (mySrvLookupErr != err.NoErr) { return 0, err.ErrFatal }
 
 		freeBlockid, myblockidlookuperr := nextDataserver.GetFreeBlock (ns)
-		if (myblockidlookuperr != err.NoErr) {
-			return 0, myblockidlookuperr
-		}
+		if (myblockidlookuperr != err.NoErr) { return 0, myblockidlookuperr }
 
 		writeSize = 0
 		if (blocksize > (totalSize - curSize)) {
@@ -665,19 +797,19 @@ func (myFS *MyGoFS) Write (namespace string, buff []byte) (uint64, err.SysError)
 			writeSize = blocksize
 		}
 
-		fmt.Printf ("Writing %d/%d to block %d on server %s\n", writeSize, len (buff), freeBlockid, serverURI.String())
+		fmt.Printf ("Writing %d/%d to block %d on server %s\n", writeSize, len (buff), freeBlockid, serverURI)
 		sendWriteReqErr := myFS.SendWriteReq (nextDataserver, namespace, freeBlockid, 0, buff, writeSize, curSize)
-	        if (sendWriteReqErr != err.NoErr) {
-			return 0, err.ErrFatal
-		}
+	        if (sendWriteReqErr != err.NoErr) { return 0, err.ErrFatal }
 
 		curSize += writeSize
 
 		// Update the block map & last block used info
 		update_err := myFS.UpdateLastWriteInfo (nextDataserver, namespace, freeBlockid, 0, writeSize)
-		if (update_err != err.NoErr) {
-			return 0, update_err
-		}
+		if (update_err != err.NoErr) { return 0, update_err }
+
+		fmt.Println ("Wrote", curSize, "bytes so far")
+
+		fmt.Println ("****************")
 	}
 
 	return curSize, err.NoErr
@@ -687,11 +819,81 @@ func (myFS *MyGoFS) Write (namespace string, buff []byte) (uint64, err.SysError)
  * Read from an initialized file system
  * @param[in]	namespace	Namespace's name from wich we want to read
  * @param[in]	size		Size to read. Read operations are assumed to be serialized, in order, starting at the begining of the namespace
+ * @return	Buffer with the received data
  * @return	System error handle
  * Example
  * s, buff, err := myFS.Read ("namespace2", size)
  */
-func (myFS *MyGoFS) Read (namespace string, size uint64) (uint64, []byte, err.SysError) {
-	return 0, nil, err.NoErr
+func (myFS *MyGoFS) Read (namespace string, size uint64) ([]byte, err.SysError) {
+	// First we look up the namespace
+        ns, mynserr := myFS.LookupNamespace (namespace)
+        if (mynserr != err.NoErr) { return nil, err.ErrFatal }
+
+	data := make ([]byte, size)
+
+	var totalReadSize uint64 = 0
+	for (totalReadSize < size) {
+		// Lookup where the data is (server + blockid)
+		dataserver, blockid, _, _, global_offset, mylookuperr := myFS.LookupLastReadBlockUsed (namespace)
+		if (mylookuperr != err.NoErr) { return nil, mylookuperr }
+
+		// First thing to figure out: can we read more data from the last block we accessed?
+		var targetDS *Dataserver = nil
+		var di *DataInfo = nil
+		for i := 0; i < len (ns.datainfo); i++ {
+			if (ns.datainfo[i].start <= global_offset && ns.datainfo[i].end > global_offset) {
+				targetDS = ns.datainfo[i].server
+				di = ns.datainfo[i]
+				fmt.Println ("Found data starting at", global_offset, ", it is in block", blockid, "(", di.start, "-", di.end, ")")
+				break
+			}
+
+			if (global_offset == ns.datainfo[i].end) {
+				// We reached the end of the last block we read, so we look for the next chunk
+				targetDS = ns.datainfo[i+1].server
+				di = ns.datainfo[i+1]
+			}
+		}
+
+		// if not the first read, global_offset points right now to the last piece
+		// we already read so we will strat reading right after that
+		nextReadGlobalOffset := global_offset
+
+		if (targetDS != nil) {
+			// We found a server, we start with some sanity checks
+			if (dataserver != targetDS) {
+				fmt.Println ("Inconsistent server bookkeeping")
+				return nil, err.ErrFatal
+			}
+
+			// How much more data can we get from there?
+			readSize := di.end - nextReadGlobalOffset + 1
+			if (readSize + totalReadSize > size) { readSize = size - totalReadSize }
+
+			// Get that data
+			fmt.Println ("Sending read req to server", dataserver.surl, ", blockid: ", di.blockid, "offset: ", di.blockoffset, ", for ", readSize, "bytes")
+			senderr := myFS.SendReadReq (dataserver, namespace, di.blockid, di.blockoffset, readSize)
+			if (senderr != err.NoErr) { return nil, senderr }
+			msgtype, datasize, blockdata, recverr := comm.RecvMsg (dataserver.conn)
+			if (msgtype != comm.RDREPLY || datasize != readSize || blockdata == nil || recverr != err.NoErr) { return nil, err.ErrFatal }
+			fmt.Println ("Received data for range", nextReadGlobalOffset, "to", nextReadGlobalOffset + readSize, "(", readSize, "bytes) from", dataserver.surl, ", blockid:", di.blockid, ", offset:", di.blockoffset)
+
+			// Copy the received data to the target buffer
+			fmt.Println ("Copying data to target buffer")
+			copy (data[totalReadSize:totalReadSize + readSize], blockdata)
+
+			fmt.Println ("Updating read info after reading", readSize, "byte")
+			myFS.UpdateLastReadInfo (dataserver, namespace, di.blockid, readSize)
+
+			totalReadSize += readSize
+			fmt.Println ("We read", totalReadSize, "bytes so far")
+		} else {
+			// Nothing to read
+			return nil, err.NoErr
+		}
+	}
+	fmt.Println ("****************")
+
+	return data, err.NoErr
 }
 
